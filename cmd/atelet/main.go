@@ -1352,6 +1352,25 @@ func (s *AteomHerder) Terminate(ctx context.Context, req *ateletpb.TerminateRequ
 	return &ateletpb.TerminateResponse{}, nil
 }
 
+// ReclaimActorDirs removes the actor's directory tree from this node, local
+// (pause) checkpoints included, the way Terminate ends. A node that holds
+// nothing of the actor succeeds, so retries are safe.
+func (s *AteomHerder) ReclaimActorDirs(ctx context.Context, req *ateletpb.ReclaimActorDirsRequest) (*ateletpb.ReclaimActorDirsResponse, error) {
+	if err := validateReclaimActorDirsRequest(req); err != nil {
+		return nil, apierror.InvalidArgument("%v", err)
+	}
+
+	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	actorUID := req.GetActorUid()
+	if err := pruneLocalCheckpoints(ctx, actorUID); err != nil {
+		return nil, fmt.Errorf("failed to prune local checkpoints (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
+	}
+	if err := removeActorDirs(actorUID); err != nil {
+		return nil, fmt.Errorf("failed to remove actor directories (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
+	}
+	return &ateletpb.ReclaimActorDirsResponse{}, nil
+}
+
 // checkLocalSnapshotFiles verifies each snapshot file exists in dir as a
 // regular file. Lstat, so a symlink cannot point ateom outside the snapshot.
 func checkLocalSnapshotFiles(dir string, files []string) error {
@@ -1843,6 +1862,16 @@ func validateTerminateRequest(req *ateletpb.TerminateRequest) error {
 		names = append(names, ctr.GetName())
 	}
 	return resources.ValidateContainerNames(names)
+}
+
+// validateReclaimActorDirsRequest checks the actor identity. actor_uid names
+// the directory removed from disk, so it must be a plain resource name.
+func validateReclaimActorDirsRequest(req *ateletpb.ReclaimActorDirsRequest) error {
+	var errs field.ErrorList
+	errs = append(errs, resources.ValidateResourceName(req.GetAtespace(), field.NewPath("atespace"))...)
+	errs = append(errs, resources.ValidateResourceName(req.GetActorName(), field.NewPath("actor_name"))...)
+	errs = append(errs, resources.ValidateResourceName(req.GetActorUid(), field.NewPath("actor_uid"))...)
+	return errs.ToAggregate()
 }
 
 func validateSnapshotScope(scope ateletpb.SnapshotScope) error {

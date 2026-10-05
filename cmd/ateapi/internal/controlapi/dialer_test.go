@@ -15,6 +15,7 @@
 package controlapi
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -23,12 +24,14 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"math/big"
+	"net"
 	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/installdefaults"
+	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -36,6 +39,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -307,6 +311,45 @@ func newTestAteletIndexer(t *testing.T, pods ...*corev1.Pod) cache.Indexer {
 		}
 	}
 	return idx
+}
+
+// newBufconnAteletDialer returns a dialer whose only atelet runs on nodeName
+// and is served in-process by fake. The conn cache is pre-warmed with a
+// bufconn-backed connection for that atelet's pod UID and IP, so
+// DialForAteletOnNode(nodeName) returns it without dialing the pod IP; every
+// other node has no atelet.
+func newBufconnAteletDialer(t *testing.T, nodeName string, fake ateletpb.AteomHerderServer) *AteletDialer {
+	t.Helper()
+
+	srv := grpc.NewServer()
+	ateletpb.RegisterAteomHerderServer(srv, fake)
+	lis := bufconn.Listen(1 << 20)
+	go func() {
+		if err := srv.Serve(lis); err != nil {
+			t.Logf("fake atelet server exited: %v", err)
+		}
+	}()
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}))
+	if err != nil {
+		t.Fatalf("connecting to the fake atelet: %v", err)
+	}
+	t.Cleanup(func() {
+		conn.Close()
+		srv.Stop()
+	})
+
+	ateletPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-1", UID: "atelet-uid"},
+		Spec:       corev1.PodSpec{NodeName: nodeName},
+		Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}}},
+	}
+	dialer := NewAteletDialer(newTestAteletIndexer(t, ateletPod), installdefaults.SystemNamespace, "", "")
+	dialer.ateletConns.Add("atelet-uid", &ateletConn{ip: "10.0.0.1", conn: conn})
+	return dialer
 }
 
 func TestDialForAteletOnNode(t *testing.T) {

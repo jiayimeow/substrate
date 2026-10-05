@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -27,18 +26,13 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
-	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -1113,41 +1107,12 @@ func wireTestAssignment() *ateapipb.WorkerAssignment {
 }
 
 // newWireCaptureWorkflow builds an ActorWorkflow whose atelet dialer resolves
-// to an in-process capturing fake. The dialer's conn cache is pre-warmed with
-// a bufconn-backed connection for the atelet pod's UID and IP, so
-// DialForAteletOnNode returns it without dialing the pod IP.
+// to an in-process capturing fake (see newBufconnAteletDialer).
 func newWireCaptureWorkflow(t *testing.T, persistence store.Interface) (*ActorWorkflow, *capturingAtelet) {
 	t.Helper()
 
 	fake := &capturingAtelet{}
-	srv := grpc.NewServer()
-	ateletpb.RegisterAteomHerderServer(srv, fake)
-	lis := bufconn.Listen(1 << 20)
-	go func() {
-		if err := srv.Serve(lis); err != nil {
-			t.Logf("fake atelet server exited: %v", err)
-		}
-	}()
-	conn, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return lis.DialContext(ctx)
-		}))
-	if err != nil {
-		t.Fatalf("connecting to the fake atelet: %v", err)
-	}
-	t.Cleanup(func() {
-		conn.Close()
-		srv.Stop()
-	})
-
-	ateletPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-1", UID: "atelet-uid"},
-		Spec:       corev1.PodSpec{NodeName: "node-1"},
-		Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}}},
-	}
-	dialer := NewAteletDialer(newTestAteletIndexer(t, ateletPod), installdefaults.SystemNamespace, "", "")
-	dialer.ateletConns.Add("atelet-uid", &ateletConn{ip: "10.0.0.1", conn: conn})
+	dialer := newBufconnAteletDialer(t, "node-1", fake)
 
 	lister := sandboxConfigListerFor(t, []*atev1alpha1.SandboxConfig{{
 		ObjectMeta: metav1.ObjectMeta{Name: "gvisor"},

@@ -177,6 +177,12 @@ service AteomHerder {
   // already sit under the actor's local-checkpoints directory.
   rpc UploadPausedCheckpoint(UploadPausedCheckpointRequest) returns (UploadPausedCheckpointResponse) {}
 
+  // ReclaimActorDirs removes an actor's directory tree from this node's disk,
+  // local (pause) checkpoints included. Like UploadPausedCheckpoint it drives
+  // no ateom: it is for an actor no worker hosts, such as a paused one being
+  // deleted, whose directory Terminate never reaches.
+  rpc ReclaimActorDirs(ReclaimActorDirsRequest) returns (ReclaimActorDirsResponse) {}
+
   // Terminate tells atelet to terminate/kill any running workload for an actor,
   // unmount its volumes, and clean up actor state on the node.
   rpc Terminate(TerminateRequest) returns (TerminateResponse) {}
@@ -501,6 +507,15 @@ message UploadPausedCheckpointRequest {
 }
 
 message UploadPausedCheckpointResponse {
+}
+
+message ReclaimActorDirsRequest {
+  string atespace = 1;
+  string actor_name = 2;
+  string actor_uid = 3;
+}
+
+message ReclaimActorDirsResponse {
 }
 
 message RestoreRequest {

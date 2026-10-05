@@ -1099,6 +1099,54 @@ func TestRemoveActorDirsKeepsPopulatedVolume(t *testing.T) {
 	}
 }
 
+// TestReclaimActorDirs checks the RPC removes everything a pause leaves of an
+// actor on the node (the reset directories, the sandbox record and the local
+// snapshots) without touching other actors, and that a retry succeeds.
+func TestReclaimActorDirs(t *testing.T) {
+	useTempNodeDirs(t)
+	const actorUID, otherUID = "actor-uid-1", "actor-uid-2"
+	for _, uid := range []string{actorUID, otherUID} {
+		if err := resetActorDirs(uid); err != nil {
+			t.Fatalf("resetActorDirs(%s): %v", uid, err)
+		}
+		if err := os.WriteFile(ateletpath.ActorSandboxAssetsFile(uid), []byte("{}"), 0o600); err != nil {
+			t.Fatalf("writing sandbox assets file: %v", err)
+		}
+		writeSnapshotDir(t, ateletpath.LocalCheckpointsDir(uid), "pause-1")
+	}
+
+	s := &AteomHerder{}
+	ctx := context.Background()
+	req := &ateletpb.ReclaimActorDirsRequest{Atespace: "ate-demo", ActorName: "counter-1", ActorUid: actorUID}
+	if _, err := s.ReclaimActorDirs(ctx, req); err != nil {
+		t.Fatalf("ReclaimActorDirs: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.ActorPath(actorUID)); !os.IsNotExist(err) {
+		t.Errorf("actor dir survived ReclaimActorDirs (stat err: %v), want it removed", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(otherUID, "pause-1")); err != nil {
+		t.Errorf("ReclaimActorDirs touched another actor's local snapshot: %v", err)
+	}
+
+	// A retry, as after a lost response, finds nothing left to remove.
+	if _, err := s.ReclaimActorDirs(ctx, req); err != nil {
+		t.Errorf("ReclaimActorDirs retry: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.ActorPath(actorUID)); !os.IsNotExist(err) {
+		t.Errorf("actor dir exists after the retry (stat err: %v), want it removed", err)
+	}
+
+	// actor_uid names the directory removed, so it cannot reach outside the
+	// actors dir.
+	req.ActorUid = "../actors/" + otherUID
+	if _, err := s.ReclaimActorDirs(ctx, req); apierror.Code(err) != codes.InvalidArgument {
+		t.Errorf("ReclaimActorDirs with a traversing actor_uid = %v, want InvalidArgument", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalSnapshotDir(otherUID, "pause-1")); err != nil {
+		t.Errorf("a rejected ReclaimActorDirs touched another actor's local snapshot: %v", err)
+	}
+}
+
 // blockerDesc registers a single unary method whose handler blocks until block
 // is closed (or the RPC context is cancelled). It lets a test hold one RPC
 // "in-flight" across a drain without any generated proto.
@@ -1565,6 +1613,33 @@ func TestValidateUploadPausedCheckpointRequest(t *testing.T) {
 			tc.mutate(req)
 			if err := validateUploadPausedCheckpointRequest(req); (err != nil) != tc.wantErr {
 				t.Errorf("validateUploadPausedCheckpointRequest err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateReclaimActorDirsRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*ateletpb.ReclaimActorDirsRequest)
+		wantErr bool
+	}{
+		{"valid", func(*ateletpb.ReclaimActorDirsRequest) {}, false},
+		{"invalid atespace", func(r *ateletpb.ReclaimActorDirsRequest) { r.Atespace = "../escape" }, true},
+		{"invalid actor name", func(r *ateletpb.ReclaimActorDirsRequest) { r.ActorName = "UPPER" }, true},
+		{"empty actor uid", func(r *ateletpb.ReclaimActorDirsRequest) { r.ActorUid = "" }, true},
+		{"actor uid escaping the actors dir", func(r *ateletpb.ReclaimActorDirsRequest) { r.ActorUid = "../escape" }, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &ateletpb.ReclaimActorDirsRequest{
+				Atespace:  "ate-demo",
+				ActorName: "counter-1",
+				ActorUid:  "123e4567-e89b-12d3-a456-426614174000",
+			}
+			tc.mutate(req)
+			if err := validateReclaimActorDirsRequest(req); (err != nil) != tc.wantErr {
+				t.Errorf("validateReclaimActorDirsRequest err = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
 	}

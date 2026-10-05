@@ -17,15 +17,19 @@ package controlapi
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
 	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
+	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestDeleteActorWorkflow_ExecutionPaths(t *testing.T) {
@@ -513,5 +517,165 @@ func TestDeleteActor_CollectsSnapshotsAfterWorkerDelete(t *testing.T) {
 				t.Errorf("deleting the actor left %v under its own prefix, want everything it wrote collected", left)
 			}
 		})
+	}
+}
+
+// reclaimRecordingAtelet is a fake atelet that records every ReclaimActorDirs
+// request and fails each with err while it is set.
+type reclaimRecordingAtelet struct {
+	ateletpb.UnimplementedAteomHerderServer
+
+	mu       sync.Mutex
+	err      error
+	requests []*ateletpb.ReclaimActorDirsRequest
+}
+
+func (f *reclaimRecordingAtelet) ReclaimActorDirs(_ context.Context, req *ateletpb.ReclaimActorDirsRequest) (*ateletpb.ReclaimActorDirsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests = append(f.requests, proto.Clone(req).(*ateletpb.ReclaimActorDirsRequest))
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &ateletpb.ReclaimActorDirsResponse{}, nil
+}
+
+func (f *reclaimRecordingAtelet) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
+func (f *reclaimRecordingAtelet) reclaims() []*ateletpb.ReclaimActorDirsRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.requests)
+}
+
+// TestEnsureActorDirsReclaimed covers which nodes the step asks to reclaim an
+// actor's directory. Only node-1 runs an atelet.
+func TestEnsureActorDirsReclaimed(t *testing.T) {
+	snapshotOn := func(nodes ...string) *ateapipb.LocalSnapshot {
+		return &ateapipb.LocalSnapshot{SnapshotName: "pause-1", NodeVmsWithLocalSnapshots: nodes}
+	}
+	tests := []struct {
+		name         string
+		status       *ateapipb.ActorStatus
+		ateletErr    error
+		wantReclaims int
+		wantErr      bool
+	}{
+		{
+			name:         "reclaims on the node holding the snapshot",
+			status:       &ateapipb.ActorStatus{LocalSnapshot: snapshotOn("node-1")},
+			wantReclaims: 1,
+		},
+		{
+			// The node and its disk are most likely gone; failing would keep
+			// the actor DELETING for as long as they stay gone.
+			name:         "skips a node without an atelet",
+			status:       &ateapipb.ActorStatus{LocalSnapshot: snapshotOn("node-gone")},
+			wantReclaims: 0,
+		},
+		{
+			name:         "reclaims past a node without an atelet",
+			status:       &ateapipb.ActorStatus{LocalSnapshot: snapshotOn("node-gone", "node-1")},
+			wantReclaims: 1,
+		},
+		{
+			name:         "reports a failed reclaim",
+			status:       &ateapipb.ActorStatus{LocalSnapshot: snapshotOn("node-1")},
+			ateletErr:    status.Error(codes.Internal, "simulated disk failure"),
+			wantReclaims: 1,
+			wantErr:      true,
+		},
+		{
+			// Terminate reclaims the directory of an actor its worker hosts.
+			name:         "leaves an assigned actor to Terminate",
+			status:       &ateapipb.ActorStatus{WorkerAssignment: wireTestAssignment(), LocalSnapshot: snapshotOn("node-1")},
+			wantReclaims: 0,
+		},
+		{
+			name:         "skips an actor without a local snapshot",
+			status:       &ateapipb.ActorStatus{},
+			wantReclaims: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			atelet := &reclaimRecordingAtelet{err: tt.ateletErr}
+			w := &ActorWorkflow{dialer: newBufconnAteletDialer(t, "node-1", atelet)}
+			actor := &ateapipb.Actor{
+				Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "id1", Uid: someActorUID},
+				Status:   tt.status,
+			}
+
+			err := w.ensureActorDirsReclaimed(context.Background(), resources.ActorRefFromActor(actor), actor)
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("ensureActorDirsReclaimed error = %v, want error: %v", err, tt.wantErr)
+			}
+			got := atelet.reclaims()
+			if len(got) != tt.wantReclaims {
+				t.Fatalf("atelet served %d reclaims, want %d", len(got), tt.wantReclaims)
+			}
+			want := &ateletpb.ReclaimActorDirsRequest{Atespace: "team-a", ActorName: "id1", ActorUid: someActorUID}
+			for _, req := range got {
+				if !proto.Equal(req, want) {
+					t.Errorf("reclaim request = %v, want %v", req, want)
+				}
+			}
+		})
+	}
+}
+
+// TestDeleteActor_ReclaimsPausedActorsDirs covers deleting a paused actor: no
+// worker is assigned, so no Terminate reaches the node holding its local
+// snapshot and the delete must reclaim the actor's directory there. A failed
+// reclaim keeps the actor DELETING so that the retry reclaims again.
+func TestDeleteActor_ReclaimsPausedActorsDirs(t *testing.T) {
+	ctx := context.Background()
+	st, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+	w := newTestActorWorkflow(t, st, "ns", "tmpl1")
+	atelet := &reclaimRecordingAtelet{err: status.Error(codes.Internal, "simulated disk failure")}
+	w.dialer = newBufconnAteletDialer(t, "node-1", atelet)
+
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+	seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", ateapipb.ActorState_ACTOR_STATE_PAUSED, func(a *ateapipb.Actor) {
+		a.Status.LocalSnapshot = &ateapipb.LocalSnapshot{SnapshotName: "pause-1", NodeVmsWithLocalSnapshots: []string{"node-1"}}
+	})
+	paused, err := st.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+
+	if _, err := w.DeleteActor(ctx, actorRef, true, store.DeletePreconditions{}); err == nil {
+		t.Fatal("DeleteActor succeeded despite the failed reclaim, want an error")
+	}
+	stored, err := st.GetActor(ctx, actorRef)
+	if err != nil {
+		t.Fatalf("GetActor after the failed delete: %v", err)
+	}
+	if got := stored.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_DELETING {
+		t.Errorf("state after the failed delete = %v, want DELETING", got)
+	}
+
+	atelet.setErr(nil)
+	if _, err := w.DeleteActor(ctx, actorRef, true, store.DeletePreconditions{}); err != nil {
+		t.Fatalf("DeleteActor retry: %v", err)
+	}
+	if _, err := st.GetActor(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetActor after the retry = %v, want %v", err, store.ErrNotFound)
+	}
+	got := atelet.reclaims()
+	if len(got) != 2 {
+		t.Fatalf("atelet served %d reclaims, want 2 (the failed one and the retry)", len(got))
+	}
+	want := &ateletpb.ReclaimActorDirsRequest{Atespace: "team-a", ActorName: "id1", ActorUid: paused.GetMetadata().GetUid()}
+	for _, req := range got {
+		if !proto.Equal(req, want) {
+			t.Errorf("reclaim request = %v, want %v", req, want)
+		}
 	}
 }

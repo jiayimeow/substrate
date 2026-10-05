@@ -5277,6 +5277,60 @@ func TestRevertActor_FromPaused(t *testing.T) {
 	}
 }
 
+// TestDeleteActor_FromPaused deletes a paused actor. It has no worker, so no
+// Terminate is sent; the delete asks the atelet on the node holding its local
+// pause snapshot to reclaim the actor's directory there instead.
+func TestDeleteActor_FromPaused(t *testing.T) {
+	ns := namespaceForTest("ns-delete-paused")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	workerName := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	ctx := context.Background()
+	const name = "id1"
+	actorRef := &ateapipb.ObjectRef{Atespace: testAtespace, Name: name}
+
+	if _, err := tc.client.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
+	}}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	paused, err := tc.client.PauseActor(ctx, &ateapipb.PauseActorRequest{Actor: actorRef})
+	if err != nil {
+		t.Fatalf("PauseActor failed: %v", err)
+	}
+	if diff := cmp.Diff([]string{"node1"}, paused.GetActor().GetStatus().GetLocalSnapshot().GetNodeVmsWithLocalSnapshots()); diff != "" {
+		t.Fatalf("nodes holding the pause snapshot mismatch (-want +got):\n%s", diff)
+	}
+	waitForWorkerAvailable(t, tc, workerName)
+	tc.fakeAtelet.Lock.Lock()
+	tc.fakeAtelet.TerminateCalled = false
+	tc.fakeAtelet.Lock.Unlock()
+
+	if _, err := tc.client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: actorRef, AnyState: true}); err != nil {
+		t.Fatalf("DeleteActor failed: %v", err)
+	}
+
+	tc.fakeAtelet.Lock.Lock()
+	defer tc.fakeAtelet.Lock.Unlock()
+	if !tc.fakeAtelet.ReclaimCalled {
+		t.Fatal("DeleteActor never asked atelet to reclaim the paused actor's directory")
+	}
+	want := &ateletpb.ReclaimActorDirsRequest{Atespace: testAtespace, ActorName: name, ActorUid: paused.GetActor().GetMetadata().GetUid()}
+	if diff := cmp.Diff(want, tc.fakeAtelet.ReclaimRequest, protocmp.Transform()); diff != "" {
+		t.Errorf("ReclaimActorDirs request mismatch (-want +got):\n%s", diff)
+	}
+	if tc.fakeAtelet.TerminateCalled {
+		t.Errorf("unexpected Terminate call for paused actor")
+	}
+}
+
 // TestRevertActor_FromCrashed recovers a crashed actor back to SUSPENDED at its
 // last external snapshot so it can be resumed again.
 func TestRevertActor_FromCrashed(t *testing.T) {

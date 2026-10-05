@@ -128,6 +128,10 @@ type FakeAteletServer struct {
 	UploadRequest *ateletpb.UploadPausedCheckpointRequest
 	FailUpload    error
 
+	ReclaimCalled  bool
+	ReclaimRequest *ateletpb.ReclaimActorDirsRequest
+	FailReclaim    error
+
 	TerminateCalled  bool
 	TerminateRequest *ateletpb.TerminateRequest
 	FailTerminate    error
@@ -180,6 +184,10 @@ func (f *FakeAteletServer) Reset() {
 	f.UploadRequest = nil
 	f.FailUpload = nil
 
+	f.ReclaimCalled = false
+	f.ReclaimRequest = nil
+	f.FailReclaim = nil
+
 	f.TerminateCalled = false
 	f.TerminateRequest = nil
 	f.FailTerminate = nil
@@ -200,6 +208,18 @@ func (f *FakeAteletServer) UploadPausedCheckpoint(ctx context.Context, req *atel
 		return nil, err
 	}
 	return &ateletpb.UploadPausedCheckpointResponse{}, nil
+}
+
+func (f *FakeAteletServer) ReclaimActorDirs(ctx context.Context, req *ateletpb.ReclaimActorDirsRequest) (*ateletpb.ReclaimActorDirsResponse, error) {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	f.ReclaimCalled = true
+	f.ReclaimRequest = proto.Clone(req).(*ateletpb.ReclaimActorDirsRequest)
+	if f.FailReclaim != nil {
+		return nil, f.FailReclaim
+	}
+	return &ateletpb.ReclaimActorDirsResponse{}, nil
 }
 
 func (f *FakeAteletServer) Run(ctx context.Context, req *ateletpb.RunRequest) (*ateletpb.RunResponse, error) {

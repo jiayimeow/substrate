@@ -74,6 +74,9 @@ func (w *ActorWorkflow) DeleteActor(ctx context.Context, actorRef resources.Acto
 		atletTerminatedErr = fmt.Errorf("while terminating atelet: %w", err)
 		errs = append(errs, atletTerminatedErr)
 	}
+	if err := w.ensureActorDirsReclaimed(ctx, actorRef, actor); err != nil {
+		errs = append(errs, fmt.Errorf("while reclaiming actor directories: %w", err))
+	}
 	if err := w.ensureVolumesDetachedForDelete(ctx, actor, actorTemplate); err != nil {
 		volumesDetachedErr = fmt.Errorf("while detaching volumes: %w", err)
 		errs = append(errs, volumesDetachedErr)
@@ -206,6 +209,53 @@ func (w *ActorWorkflow) ensureAteletTerminated(ctx context.Context, actorRef res
 	}
 
 	return nil
+}
+
+// ensureActorDirsReclaimed asks the atelet on each node holding the actor's
+// local (pause) snapshot to remove the actor's directory there, snapshot
+// included. It acts only when no worker is assigned: then
+// ensureAteletTerminated sends no Terminate, which is what reclaims a hosted
+// actor's directory, and a paused actor never has a worker.
+func (w *ActorWorkflow) ensureActorDirsReclaimed(ctx context.Context, actorRef resources.ActorRef, actor *ateapipb.Actor) (err error) {
+	ctx, done := stepSpan(ctx, "ReclaimActorDirs")
+	defer func() { err = done(err) }()
+
+	if actor.GetStatus().GetWorkerAssignment() != nil {
+		markSkipped(ctx, "actor has a worker assignment, Terminate reclaims its directory")
+		return nil
+	}
+	nodes := actor.GetStatus().GetLocalSnapshot().GetNodeVmsWithLocalSnapshots()
+	if len(nodes) == 0 {
+		markSkipped(ctx, "no node holds a local snapshot of the actor")
+		return nil
+	}
+
+	req := &ateletpb.ReclaimActorDirsRequest{
+		Atespace:  actor.GetMetadata().GetAtespace(),
+		ActorName: actor.GetMetadata().GetName(),
+		ActorUid:  actor.GetMetadata().GetUid(),
+	}
+	var errs []error
+	for _, node := range nodes {
+		conn, err := w.dialer.DialForAteletOnNode(node)
+		if errors.Is(err, ErrNoAteletOnNode) {
+			// Most likely the node is gone, and the directory with its disk.
+			// Failing here would keep the actor DELETING for as long as the
+			// node stays gone; the cost is that an atelet caught restarting
+			// keeps the directory.
+			slog.WarnContext(ctx, "no atelet on the node holding the actor's local snapshot, skipping reclaim",
+				slog.Any("actor", actorRef), slog.String("node", node))
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("while connecting to atelet on node %q: %w", node, err))
+			continue
+		}
+		if _, err := ateletpb.NewAteomHerderClient(conn).ReclaimActorDirs(ctx, req); err != nil {
+			errs = append(errs, fmt.Errorf("while calling atelet ReclaimActorDirs on node %q: %w", node, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ensureVolumesDetachedForDelete detaches external volumes.
