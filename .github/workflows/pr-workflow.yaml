@@ -290,3 +290,99 @@ jobs:
       env:
         MATRIX_RESULT: ${{ needs.e2e-test-matrix.result }}
       run: test "$MATRIX_RESULT" = success
+  baseline-perf:
+    name: baseline-perf (micro-VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      with:
+        fetch-depth: 0
+    - name: Setup Go
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      with:
+        go-version-file: 'go.mod'
+    - name: Cache micro-VM assets
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: bin/microvm-assets/amd64
+        key: microvm-assets-amd64-${{ hashFiles('hack/microvm-assets/assemble.sh') }}
+    - name: Enable KVM
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+    - name: Create cluster
+      run: hack/create-kind-cluster.sh
+    - name: Install Agent Substrate
+      run: hack/install-ate-kind.sh --deploy-ate-system
+    - name: Run baseline-perf (micro-VM)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        NO_DEV_ENV: "true"
+        KO_DOCKER_REPO: localhost:5001
+        BUCKET_NAME: ate-snapshots
+        KUBECTL_CONTEXT: kind-kind
+        ATE_INSTALL_KIND: "true"
+        SWEPERF_IMAGE: us-docker.pkg.dev/gke-substrate-release/benchmark/sweperf@sha256:c265bfba3bea40c99e7baad734579b75d02dab6dbe6910cb1f9ed71c8b08f5b1
+        WORKLOAD_TEMPLATES: swebench-astropy-7336
+      run: |
+        hack/install-microvm-deps.sh --install
+        benchmarking/workloads/deploy.sh --deploy --sandbox-class microvm
+        mkdir -p "${GITHUB_WORKSPACE}/bin"
+        go build -o "${GITHUB_WORKSPACE}/bin/kubectl-ate" ./cmd/kubectl-ate
+        ln -sf "$(./hack/run-tool.sh --print-bin-path ko)" "${GITHUB_WORKSPACE}/bin/ko"
+        export PATH="${GITHUB_WORKSPACE}/bin:${PATH}"
+
+        out="$(mktemp)"
+        report="$(mktemp)"
+        base_ref="origin/${GITHUB_BASE_REF:-main}"
+        FORCE_COLOR=1 ./benchmarking/baseline-perf/baseline-perf \
+          --compare "atelet=.@${base_ref}" atelet=stock \
+          --rounds 2 | tee "${out}"
+
+        python3 - "${out}" > "${report}" <<'PY'
+        import re, sys
+        with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+          text = re.sub(r"\x1b\[[0-9;]*m", "", f.read())
+        blocks, cur, rules = [], None, 0
+        for line in text.splitlines():
+          if line.startswith("═" * 20):
+            if cur is None or rules >= 2:
+              if cur:
+                blocks.append("\n".join(cur).strip())
+              cur, rules = [line], 1
+            else:
+              cur.append(line)
+              rules += 1
+          elif line.startswith("━━ "):
+            if cur:
+              blocks.append("\n".join(cur).strip())
+              cur, rules = None, 0
+          elif cur is not None:
+            cur.append(line)
+        if cur:
+          blocks.append("\n".join(cur).strip())
+        arm_b = [b for b in blocks if "\n arm  B ·" in b]
+        ab_rep = [b for b in blocks if "\n baseline-perf A/B ·" in b]
+        if arm_b and ab_rep:
+          best_b = next((b for b in reversed(arm_b) if "vm_restore" in b), arm_b[-1])
+          print("### 🚀 baseline-perf (PR · micro-VM · swebench-astropy-7336)")
+          print("```text\n" + best_b + "\n```\n")
+          print("### 📊 baseline-perf --compare (main vs PR)")
+          print("```text\n" + ab_rep[-1] + "\n```")
+        elif blocks:
+          print("### 🚀 baseline-perf (micro-VM · swebench-astropy-7336)")
+          print("```text\n" + "\n\n".join(blocks) + "\n```")
+        PY
+
+        cat "${report}" >> "${GITHUB_STEP_SUMMARY}"
+        if [[ -n "${GH_TOKEN:-}" && "${PR_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+          gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file "${report}"
+        fi

@@ -46,6 +46,11 @@ containers:
   env:
   - name: SWEPERF_DISABLE_INTERNAL_SLEEP
     value: "1"
+  wakeupProbe:
+    httpGet:
+      path: /status
+      port: 80
+    timeoutSeconds: 120
 sandboxConfig:
   sandboxClass: ${SANDBOX_CLASS_ENUM}
   configName: ${SANDBOX_CONFIG_NAME}
