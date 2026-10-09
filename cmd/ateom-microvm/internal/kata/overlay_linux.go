@@ -100,11 +100,12 @@ type VirtiofsdOptions struct {
 	SocketPath string // vhost-user socket CH connects to (VirtiofsdSocketPath)
 	SharedDir  string // directory to serve (SharedDir(id))
 	Log        io.Writer
+	Xattr      bool // pass through xattrs (the guest overlay's user.overlay.*)
 }
 
 // virtiofsdArgs builds the virtiofsd command line for o.
 func virtiofsdArgs(o VirtiofsdOptions) []string {
-	return []string{
+	args := []string{
 		"--socket-path=" + o.SocketPath,
 		"--shared-dir=" + o.SharedDir,
 		"--cache=auto",
@@ -112,6 +113,10 @@ func virtiofsdArgs(o VirtiofsdOptions) []string {
 		"--announce-submounts",
 		"--migration-mode", "find-paths",
 	}
+	if o.Xattr {
+		args = append(args, "--xattr")
+	}
+	return args
 }
 
 // StartVirtiofsd launches virtiofsd in find-paths migration mode serving o.SharedDir
@@ -261,6 +266,11 @@ func StageMergedRootfs(ctx context.Context, bundleRootfs, upperBase, restoreID, 
 // os.Root: a plain MkdirAll would follow a symlink planted at one of those names and
 // create the directory wherever it points on the worker pod, as root. An entry that
 // already exists (including a symlink that stays inside the rootfs) is left alone.
+// EnsureOCIMountpoints is ensureOCIMountpoints for callers outside the package
+// (the erofs-pmem lower, where the mountpoints go into the image before it is
+// packed).
+func EnsureOCIMountpoints(rootfs string) error { return ensureOCIMountpoints(rootfs) }
+
 func ensureOCIMountpoints(rootfs string) error {
 	root, err := os.OpenRoot(rootfs)
 	if err != nil {
@@ -414,6 +424,64 @@ func (a *AgentClient) StartRootfsContainer(ctx context.Context, cid string, spec
 	}
 	if err := a.StartContainer(ctx, cid); err != nil {
 		return fmt.Errorf("starting rootfs container %q: %w", cid, err)
+	}
+	return nil
+}
+
+// GuestOverlayShareRel is where a container's rootfs-upper dir (fs/ + work/) is
+// bound under SharedDir for the erofs-pmem lower; the guest sees it at
+// <guestSharedDir><GuestOverlayShareRel(cid)>.
+func GuestOverlayShareRel(cid string) string { return filepath.Join(cid, "ovl") }
+
+// StartErofsContainer creates + starts one container on a guest-side overlay:
+// the agent mounts the image's EROFS from /dev/pmem<idx> with DAX, then
+// overlay(lower = that, upper/work = the shared rootfs-upper dirs, userxattr),
+// and the container runs on the merged tree. metacopy/index off for the same
+// reason as StageMergedRootfs (no file handles to lower inodes in the upper).
+func (a *AgentClient) StartErofsContainer(ctx context.Context, cid string, spec *specs.Spec, idx int) error {
+	lower := "/run/kata-containers/erofs/" + cid
+	merged := "/run/kata-containers/merged/" + cid
+	shared := guestSharedDir + GuestOverlayShareRel(cid)
+	storages := []*agentpb.Storage{
+		{
+			// Not "nvdimm": that handler waits for a hotplug uevent, and a
+			// device present at boot never sends one. The virtio-fs handler
+			// only runs the generic mount_storage, i.e. mount(Source, MountPoint,
+			// Fstype, Options), which is all a cold-plugged pmem needs.
+			Driver:     virtioFSDriver,
+			Source:     fmt.Sprintf("/dev/pmem%d", idx),
+			Fstype:     "erofs",
+			Options:    []string{"ro", "dax=always"},
+			MountPoint: lower,
+		},
+		{
+			Driver: "overlayfs",
+			Source: "overlay",
+			Fstype: "overlay",
+			Options: []string{
+				"lowerdir=" + lower,
+				"upperdir=" + shared + "/fs",
+				"workdir=" + shared + "/work",
+				"userxattr", "metacopy=off", "index=off",
+			},
+			MountPoint: merged,
+		},
+	}
+	pbSpec := SpecToAgentPB(spec)
+	pbSpec.Root = &agentpb.Root{Path: merged, Readonly: false}
+	if pbSpec.Linux != nil {
+		pbSpec.Linux.CgroupsPath = "/ateomchv/" + cid
+	}
+	if err := a.CreateContainer(ctx, &agentpb.CreateContainerRequest{
+		ContainerId: cid,
+		ExecId:      cid,
+		OCI:         pbSpec,
+		Storages:    storages,
+	}); err != nil {
+		return fmt.Errorf("creating erofs container %q: %w", cid, err)
+	}
+	if err := a.StartContainer(ctx, cid); err != nil {
+		return fmt.Errorf("starting erofs container %q: %w", cid, err)
 	}
 	return nil
 }
