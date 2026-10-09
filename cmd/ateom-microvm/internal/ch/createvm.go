@@ -33,6 +33,15 @@ type VmConfig struct {
 	Console  *ConsoleConfig  `json:"console,omitempty"`
 	Vsock    *VsockConfig    `json:"vsock,omitempty"`
 	Platform *PlatformConfig `json:"platform,omitempty"`
+	Pmem     []PmemConfig    `json:"pmem,omitempty"`
+}
+
+// PmemConfig is one virtio-pmem device backed by File (its size must be a
+// multiple of 2 MiB). DiscardWrites maps it MAP_PRIVATE: guest writes never
+// reach the file, so one file can back every actor's device.
+type PmemConfig struct {
+	File          string `json:"file"`
+	DiscardWrites bool   `json:"discard_writes"`
 }
 
 // FsConfig is a virtio-fs device backed by a vhost-user (virtiofsd) socket. The
