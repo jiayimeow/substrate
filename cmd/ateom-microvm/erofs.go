@@ -57,7 +57,7 @@ const (
 // defaultContainerLower is overridable at link time
 // (-X main.defaultContainerLower=erofs-pmem) so a worker image can flip the
 // default without a WorkerPool arg; ATEOM_CONTAINER_LOWER overrides both.
-var defaultContainerLower = containerLowerVirtiofs
+var defaultContainerLower = containerLowerErofsPmem
 
 func containerLower() string {
 	if v := os.Getenv("ATEOM_CONTAINER_LOWER"); v != "" {
