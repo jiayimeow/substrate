@@ -444,7 +444,11 @@ func (a *AgentClient) StartErofsContainer(ctx context.Context, cid string, spec 
 	shared := guestSharedDir + GuestOverlayShareRel(cid)
 	storages := []*agentpb.Storage{
 		{
-			Driver:     "nvdimm",
+			// Not "nvdimm": that handler waits for a hotplug uevent, and a
+			// device present at boot never sends one. The virtio-fs handler
+			// only runs the generic mount_storage, i.e. mount(Source, MountPoint,
+			// Fstype, Options), which is all a cold-plugged pmem needs.
+			Driver:     virtioFSDriver,
 			Source:     fmt.Sprintf("/dev/pmem%d", idx),
 			Fstype:     "erofs",
 			Options:    []string{"ro", "dax=always"},
